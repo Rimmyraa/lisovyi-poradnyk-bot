@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - bot-data:/data   # база документів переживає перезапуски
+    restart: unless-stopped
+
+volumes:
+  bot-data:

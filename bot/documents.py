@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,10 +23,11 @@ def sha256_bytes(data: bytes) -> str:
 
 @dataclass
 class UploadResult:
-    status: str                       # saved | duplicate | need_place | empty | unsupported
+    status: str                       # saved | duplicate | outdated | need_place | empty | unsupported
     document: Document | None = None
     pending: PendingDoc | None = None
     title: str = ""
+    replaced: list[Document] = field(default_factory=list)  # старі версії, які замінив цей документ
 
 
 class DocumentService:
@@ -64,8 +65,9 @@ class DocumentService:
                 log.warning("Не вдалося визначити область для %s — вважаю порадою для всього лісу", path.name)
                 places = [FOREST]
             mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
-            self.storage.add_document(title=title, filename=path.name, source="archive", places=places,
-                                      text=text, sha256=sha, sent_at=mtime, ocr=ocr)
+            doc_id = self.storage.add_document(title=title, filename=path.name, source="archive", places=places,
+                                               text=text, sha256=sha, sent_at=mtime, ocr=ocr)
+            self.storage.supersede_versions(self.storage.get(doc_id))
             added += 1
             log.info("Архів: %s → %s%s", title, places, " (OCR)" if ocr else "")
         return added
@@ -89,6 +91,9 @@ class DocumentService:
         sha = sha256_bytes(data)
         existing = self.storage.has_sha(sha)
         if existing:
+            if existing.superseded_by:
+                current = self.storage.current_version(existing)
+                return UploadResult("outdated", document=current, title=existing.title)
             return UploadResult("duplicate", document=existing, title=existing.title)
         pend = self.storage.pending_doc_by_sha(user_id, sha)
         if pend:
@@ -118,20 +123,23 @@ class DocumentService:
         doc_id = self.storage.add_document(title=title, filename=filename, source="telegram", places=places,
                                            text=text, sha256=sha, sent_at=sent_at, sender_id=user_id,
                                            sender_name=sender_name, ocr=ocr)
-        doc = next(d for d in self.storage.all_documents() if d.id == doc_id)
-        return UploadResult("saved", document=doc, title=title)
+        doc = self.storage.get(doc_id)
+        replaced = self.storage.supersede_versions(doc)
+        return UploadResult("saved", document=doc, title=title, replaced=replaced)
 
-    def resolve_pending(self, pending: PendingDoc, places: list[str]) -> Document:
+    def resolve_pending(self, pending: PendingDoc, places: list[str]) -> tuple[Document, list[Document]]:
+        """Зберігає документ після уточнення місця. Повертає (документ, замінені старі версії)."""
         existing = self.storage.has_sha(pending.sha256)
         if existing:
             self.storage.delete_pending_doc(pending.id)
-            return existing
+            return self.storage.current_version(existing), []
         doc_id = self.storage.add_document(title=pending.title, filename=pending.filename, source="telegram",
                                            places=places, text=pending.text, sha256=pending.sha256,
                                            sent_at=pending.sent_at, sender_id=pending.user_id,
                                            sender_name=pending.sender_name, ocr=pending.ocr)
         self.storage.delete_pending_doc(pending.id)
-        return next(d for d in self.storage.all_documents() if d.id == doc_id)
+        doc = self.storage.get(doc_id)
+        return doc, self.storage.supersede_versions(doc)
 
 
 async def sync_drive(folder_id: str, api_key: str, dest: Path) -> bool:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -65,6 +66,14 @@ class Document:
     text: str
     ocr: bool = False
     sha256: str = ""
+    superseded_by: int | None = None
+
+
+def title_key(title: str) -> str:
+    t = title.lower().replace("’", "'").replace("ʼ", "'")
+    t = re.sub(r"\.(pdf|docx|txt)$", "", t)
+    t = re.sub(r"\(\d+\)$|\bкопія\b|\bcopy\b|\bv?\d+(\.\d+)*$", "", t.strip())  # «назва (1)», «назва v2»
+    return re.sub(r"[^a-zа-яіїєґ0-9]+", " ", t).strip()
 
 
 @dataclass
@@ -88,6 +97,9 @@ class Storage:
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(documents)")}
+        if "superseded_by" not in cols:  # міграція старої бази
+            self.db.execute("ALTER TABLE documents ADD COLUMN superseded_by INTEGER")
         self.db.commit()
 
     # ---- documents ----
@@ -107,19 +119,49 @@ class Storage:
         self.db.commit()
         return int(cur.lastrowid)
 
-    def all_documents(self) -> list[Document]:
-        return [self._doc(r) for r in self.db.execute("SELECT * FROM documents ORDER BY id")]
+    def all_documents(self, include_superseded: bool = False) -> list[Document]:
+        where = "" if include_superseded else " WHERE superseded_by IS NULL"
+        return [self._doc(r) for r in self.db.execute(f"SELECT * FROM documents{where} ORDER BY id")]
+
+    def get(self, doc_id: int) -> Document | None:
+        r = self.db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+        return self._doc(r) if r else None
+
+    def current_version(self, doc: Document) -> Document:
+        """Для заміненого документа повертає чинну версію."""
+        while doc.superseded_by:
+            nxt = self.get(doc.superseded_by)
+            if not nxt:
+                break
+            doc = nxt
+        return doc
+
+    def supersede_versions(self, new: Document) -> list[Document]:
+        """Новіша версія того самого документа для того самого місця замінює старі.
+
+        «Той самий документ» = однакова назва (без урахування регістру й розділових знаків)
+        і однаковий набір місць.
+        """
+        replaced = []
+        for d in self.all_documents():
+            if d.id != new.id and title_key(d.title) == title_key(new.title) and set(d.places) == set(new.places):
+                self.db.execute("UPDATE documents SET superseded_by=? WHERE id=?", (new.id, d.id))
+                replaced.append(d)
+        self.db.commit()
+        return replaced
 
     def count(self, source: str | None = None) -> int:
+        q = "SELECT COUNT(*) FROM documents WHERE superseded_by IS NULL"
         if source:
-            return self.db.execute("SELECT COUNT(*) FROM documents WHERE source=?", (source,)).fetchone()[0]
-        return self.db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            return self.db.execute(q + " AND source=?", (source,)).fetchone()[0]
+        return self.db.execute(q).fetchone()[0]
 
     @staticmethod
     def _doc(r: sqlite3.Row) -> Document:
         return Document(id=r["id"], title=r["title"], filename=r["filename"], source=r["source"],
                         places=json.loads(r["places"]), sender_id=r["sender_id"], sender_name=r["sender_name"],
-                        sent_at=r["sent_at"], text=r["text"], ocr=bool(r["ocr"]), sha256=r["sha256"])
+                        sent_at=r["sent_at"], text=r["text"], ocr=bool(r["ocr"]), sha256=r["sha256"],
+                        superseded_by=r["superseded_by"])
 
     # ---- pending docs ----
     def add_pending_doc(self, *, user_id: int, chat_id: int, title: str, filename: str, sender_name: str | None,

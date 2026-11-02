@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from .documents import DocumentService
 from .forest_map import FOREST, PARTS, ForestMap, norm
-from .qa import QA, scope_label
+from .qa import QA, fmt_date, scope_label
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,19 @@ def places_keyboard(fmap: ForestMap, prefix: str, item_id: int, with_forest: boo
     if with_forest:
         rows.append([InlineKeyboardButton(text="🌳 Для всього лісу", callback_data=f"{prefix}:{item_id}:{fmap.code(FOREST)}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def saved_text(doc, replaced, tz: str) -> str:
+    text = f"Дякую! Запам'ятав «{doc.title}»: це порада {scope_label(doc.places)}."
+    if replaced:
+        old = replaced[-1]
+        who = (f"від {old.sender_name}, {fmt_date(old.sent_at, tz)}" if old.source == "telegram"
+               else "з «Лісового архіву»")
+        text += (f"\n\nЦе нова версія документа, тож попередню ({who}) я замінив: "
+                 f"звірі тепер бачитимуть лише чинну пораду.")
+    else:
+        text += " Тепер я розповідатиму про неї іншим звірам і казатиму, що її надіслав(-ла) ти."
+    return text
 
 
 def place_from_text(text: str, fmap: ForestMap) -> list[str]:
@@ -101,8 +114,10 @@ def build_router(qa: QA, docs: DocumentService, fmap: ForestMap, tmp_dir: Path, 
         )
         if res.status == "saved":
             qa.reindex()
-            await msg.answer(f"Дякую! Запам'ятав «{res.title}»: це порада {scope_label(res.document.places)}. "
-                             f"Тепер я розповідатиму про неї іншим звірам і казатиму, що її надіслав(-ла) ти.")
+            await msg.answer(saved_text(res.document, res.replaced, qa.tz))
+        elif res.status == "outdated":
+            await msg.answer(f"Це стара версія «{res.title}». Її вже замінено новішою, тож чинною лишається "
+                             f"«{res.document.title}» ({scope_label(res.document.places)}).")
         elif res.status == "duplicate":
             await msg.answer(f"Цей документ у мене вже є: «{res.title}» ({scope_label(res.document.places)}).")
         elif res.status == "need_place":
@@ -128,9 +143,9 @@ def build_router(qa: QA, docs: DocumentService, fmap: ForestMap, tmp_dir: Path, 
         if not pending or pending.user_id != cb.from_user.id or not place:
             await cb.answer("Цей документ уже збережено або запит застарів.", show_alert=False)
             return
-        doc = docs.resolve_pending(pending, [place])
+        doc, replaced = docs.resolve_pending(pending, [place])
         qa.reindex()
-        await cb.message.edit_text(f"Дякую! Запам'ятав «{doc.title}»: це порада {scope_label(doc.places)}.")
+        await cb.message.edit_text(saved_text(doc, replaced, qa.tz))
         await cb.answer()
 
     @r.callback_query(F.data.startswith("q:"))
@@ -152,9 +167,9 @@ def build_router(qa: QA, docs: DocumentService, fmap: ForestMap, tmp_dir: Path, 
         if pending and "?" not in text and len(text.split()) <= 6:
             places = place_from_text(text, fmap)
             if places:
-                doc = docs.resolve_pending(pending, places)
+                doc, replaced = docs.resolve_pending(pending, places)
                 qa.reindex()
-                await msg.answer(f"Дякую! Запам'ятав «{doc.title}»: це порада {scope_label(doc.places)}.")
+                await msg.answer(saved_text(doc, replaced, qa.tz))
                 return
             await msg.answer(f"Не впізнав місця. Для кого порада «{pending.title}»? Обери, будь ласка:",
                              reply_markup=places_keyboard(fmap, "dp", pending.id, True))

@@ -191,7 +191,8 @@ def test_upload_with_unclear_place_asks_sender(env, tmp_path):
                                 data=text.encode(), tmp_dir=tmp_path))
     assert res.status == "need_place"
     assert st.count("telegram") == 0
-    doc = svc.resolve_pending(res.pending, ["хвойний ліс"])
+    doc, replaced = svc.resolve_pending(res.pending, ["хвойний ліс"])
+    assert replaced == []
     assert doc.places == ["хвойний ліс"] and doc.sender_name == "Сова"
     assert st.oldest_pending_doc(5) is None
 
@@ -221,3 +222,41 @@ def test_classify_rules_cases(env):
     assert classify_rules("Порада", "Порада\n\nЦя пам'ятка для всіх мешканців лісу.", fm) == [FOREST]
     assert classify_rules("Порада", "Порада\n\nДля тих, хто живе біля річки: не купайтеся.", fm) == [PART_RIVER]
     assert classify_rules("Корисне", "Корисне\n\nСушіть гриби на сонці.", fm) is None
+
+
+# ---------- версії документів ----------
+
+def test_new_version_replaces_old_for_same_place(env, tmp_path):
+    st, fm, svc = env
+    svc.llm = FakeLLM(fm)
+    new = ("Членські внески рукавички «Під ялиною»\n\nВнесок тепер 5 шишок з дорослого звіра на місяць. "
+           "Здавати Дятлові.")
+    res = run(svc.handle_upload(user_id=9, chat_id=9, sender_name="Мишка", data=new.encode(),
+                                filename="Членські внески рукавички Під ялиною.txt", tmp_dir=tmp_path))
+    assert res.status == "saved" and len(res.replaced) == 1 and res.replaced[0].source == "archive"
+    assert st.count() == 78  # стару версію замінено, а не додано ще одну
+    llm = FakeLLM(fm)
+    qa = QA(st, fm, llm)
+    run(qa.answer(1, "Які внески в рукавичці під ялиною?"))
+    assert "5 шишок" in llm.last_context and "3 шишки" not in llm.last_context
+
+    # повторне надсилання старої версії не повертає її
+    old = (ARCHIVE / "Членські внески рукавички Під ялиною.pdf").read_bytes()
+    res2 = run(svc.handle_upload(user_id=9, chat_id=9, sender_name="x", data=old,
+                                 filename="Членські внески рукавички Під ялиною.pdf", tmp_dir=tmp_path))
+    assert res2.status == "outdated" and "5 шишок" in res2.document.text
+
+
+def test_same_title_other_place_is_not_replaced(env, tmp_path):
+    st, fm, svc = env
+    svc.llm = FakeLLM(fm)
+    text = "Небезпеки хвойного лісу\n\nПорада для мешканців рукавички «У соснах»: обходьте нову яму."
+    res = run(svc.handle_upload(user_id=9, chat_id=9, sender_name="Зайчик", data=text.encode(),
+                                filename="x.txt", caption="для рукавички У соснах", tmp_dir=tmp_path))
+    assert res.status == "saved" and res.replaced == []
+    assert st.count() == 79
+
+
+def test_title_key_ignores_copy_suffixes():
+    from bot.storage import title_key
+    assert title_key("Правила толоки (1)") == title_key("правила толоки.txt") == title_key("Правила толоки v2")

@@ -90,6 +90,10 @@ class GroqLLM:
                                     "max_tokens": max_tokens}
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
+            if model.startswith("openai/gpt-oss"):
+                # Міркувальна модель: міркування теж витрачають max_tokens, тож даємо запас.
+                body["reasoning_effort"] = "low"
+                body["max_tokens"] = max_tokens + 1500
             for attempt in range(2):
                 try:
                     async with s.post(f"{API}/chat/completions", json=body) as r:

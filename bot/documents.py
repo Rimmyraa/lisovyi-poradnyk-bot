@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,19 +44,30 @@ class DocumentService:
         if not folder.exists():
             log.warning("Теки архіву немає: %s", folder)
             return 0
-        added = 0
+        todo = []
         for path in sorted(folder.iterdir()):
             if path.suffix.lower() not in SUPPORTED:
                 continue
-            data = path.read_bytes()
-            sha = sha256_bytes(data)
-            if self.storage.has_sha(sha):
+            sha = sha256_bytes(path.read_bytes())
+            if not self.storage.has_sha(sha):
+                todo.append((path, sha))
+        # Текст (і повільний OCR сканів) витягуємо паралельно, а зберігаємо по черзі.
+        sem = asyncio.Semaphore(max(2, (os.cpu_count() or 2) // 2))
+
+        async def extract(path: Path):
+            async with sem:
+                try:
+                    return await self._extract(path)
+                except Exception as e:
+                    log.error("Не вдалося прочитати %s: %s", path.name, e)
+                    return None
+
+        results = await asyncio.gather(*(extract(p) for p, _ in todo))
+        added = 0
+        for (path, sha), res in zip(todo, results):
+            if res is None:
                 continue
-            try:
-                text, ocr = await self._extract(path)
-            except Exception as e:
-                log.error("Не вдалося прочитати %s: %s", path.name, e)
-                continue
+            text, ocr = res
             if not text:
                 log.warning("Порожній документ в архіві: %s", path.name)
                 continue
